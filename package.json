@@ -1,0 +1,23 @@
+{
+  "name": "local_pos_api",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local POS server: sells offline from a local MongoDB and syncs with the cloud Inventory POS API",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon",
+    "test": "node tests/pos-flow.test.js"
+  },
+  "dependencies": {
+    "bcrypt": "^6.0.0",
+    "compression": "^1.8.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.0",
+    "express": "^4.21.2",
+    "mongoose": "^9.9.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9"
+  }
+}
