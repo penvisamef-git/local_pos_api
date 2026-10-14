@@ -95,6 +95,35 @@ async function pair(code) {
 }
 
 // ---------------- pull: replace the local copy of the shop's data ----------------
+// QR pictures of the payment methods are kept inside the local data (data: URI), so the customer display
+// still shows them when the internet is down. The previous copy is reused when the download fails.
+async function keepQrOffline(methods, before) {
+  const old = new Map((before || []).map((m) => [String(m._id), m]));
+  for (const m of methods || []) {
+    const url = m.qr_image;
+    if (!url || !/^https?:\/\//.test(url)) continue;
+    const prev = old.get(String(m._id));
+    if (prev?.qr_source === url && String(prev.qr_image || "").startsWith("data:")) {
+      m.qr_source = url;
+      m.qr_image = prev.qr_image;
+      continue;
+    }
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 8000);
+      const res = await fetch(url, { signal: ctrl.signal });
+      clearTimeout(t);
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (res.ok && buf.length < 2 * 1024 * 1024) {
+        m.qr_source = url;
+        m.qr_image = `data:${res.headers.get("content-type") || "image/png"};base64,${buf.toString("base64")}`;
+      }
+    } catch {
+      // keep the URL (shows when online)
+    }
+  }
+}
+
 const pull = () => serial("pull", doPull);
 async function doPull() {
   const cfg = await getConfig();
@@ -128,6 +157,8 @@ async function doPull() {
     await User.deleteMany({});
     if (d.users.length) await User.insertMany(d.users.map((u) => ({ ...u, _id: String(u._id) })), { ordered: false });
     const { products: _p, users: _u, ...rest } = d;
+    const before = await Data.findById("main").select("payment_methods").lean();
+    await keepQrOffline(rest.payment_methods, before?.payment_methods);
     await Data.replaceOne({ _id: "main" }, { _id: "main", ...rest, pulled_at: new Date() }, { upsert: true });
     await Config.updateOne({ _id: "main" }, { last_pull_at: new Date(), device: d.device, warehouse: d.warehouse, last_error: "" });
     return { products: products.length, users: d.users.length };

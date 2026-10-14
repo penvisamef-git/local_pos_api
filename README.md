@@ -41,6 +41,8 @@ Production: build the screen (`cd ../local_pos && npm run build`); this server t
 | `GET` | `/sale?problem=true` | invoices the cloud refused (any shift), with `sync_error` |
 | `POST` | `/sale/:id/retry` | send it again now → 200 sent · 409 with the cloud's reason |
 | `POST` | `/sale/:id/discard` | `{ reason, approver: { user_id, pin } }` (shop manager) → `state: discarded`: never sent, left out of totals; only for invoices not in the cloud |
+| `POST` | `/sale/:id/refund` | `{ lines: [{ index, qty }] \| all: true, reason, method_id, approver: { user_id, pin } }` → money back from the **open shift's** drawer (shop manager, or a manager's PIN); never more than left; stock back here at once; `kind: void` = everything, first time → `{ refund, sale }` |
+| `GET` | `/refund` | `?shift_id=&sale=` refunds made on this POS |
 | `POST` | `/approve` | `{ user_id, pin }` — checks a shop manager's PIN on the cashier's screen (wrong PIN → 403, the cashier stays logged in) |
 | `GET` | `/hold` | held (parked) carts of this POS, oldest first |
 | `POST` | `/hold` | `{ label, items: [{ variant_id, unit_id, qty }], discount, note, total }` → park the cart (max 50, no `H<yymmdd>-n`) |
@@ -71,3 +73,8 @@ It pairs with a real code, logs in with PINs, opens a shift, sells (USD, KHR, di
 When the admin **deletes** this POS, **turns it off**, or makes a **new pairing code**, the cloud refuses the POS key with `code: DEVICE_UNPAIRED | DEVICE_OFF`. The POS notices within ~20 s (ping, `SYNC_PING_SECONDS`) or at the next sync and then:
 - forgets the key and the shop's data (products, prices, staff, sessions, held carts) — the screen goes back to the 6-digit code with the reason (`/status` → `revoked_reason`);
 - keeps sales and shifts not sent yet: they are sent after this same POS is paired again.
+
+## Refund / void, attendance
+
+- Refunds go to the cloud with the push (after the invoices); the shift report and the day report show them (`refund_total`, `net_total`), and the expected cash goes down by what was given back in cash.
+- Each login / logout is kept (`PosEvent`) and sent with the push → attendance report and Telegram in the cloud.
