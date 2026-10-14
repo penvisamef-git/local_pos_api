@@ -1,4 +1,4 @@
-const { Config, Data, Product, User, Sale, Shift, Session, Hold, Refund, PosEvent } = require("./models");
+const { Customer, Config, Data, Product, User, Sale, Shift, Session, Hold, Refund, PosEvent } = require("./models");
 const pkg = require("../package.json");
 
 // ---------------------------------------------------------------------------------------------
@@ -72,7 +72,7 @@ async function revoke(reason) {
   if (!cfg?.device_key) return;
   console.warn(`⛔ POS unlinked by the admin web: ${reason} — local shop data cleared`);
   await Config.updateOne({ _id: "main" }, { device_key: null, last_error: reason, revoked_at: new Date(), revoked_reason: reason });
-  await Promise.all([Data.deleteMany({}), Product.deleteMany({}), User.deleteMany({}), Session.deleteMany({}), Hold.deleteMany({})]);
+  await Promise.all([Data.deleteMany({}), Product.deleteMany({}), User.deleteMany({}), Session.deleteMany({}), Hold.deleteMany({ deposit_usd: { $not: { $gt: 0 } } })]); // layaways (deposit paid) are kept
 }
 
 // is the key still good? (cheap call; unlinking is noticed within PING_EVERY_MS)
@@ -156,7 +156,19 @@ async function doPull() {
     if (products.length) await Product.insertMany(products, { ordered: false });
     await User.deleteMany({});
     if (d.users.length) await User.insertMany(d.users.map((u) => ({ ...u, _id: String(u._id) })), { ordered: false });
-    const { products: _p, users: _u, ...rest } = d;
+    // customers: the cloud list (upsert by cloud id, so local links stay) + the ones added here and not sent yet
+    if (Array.isArray(d.customers)) {
+      const ops = d.customers.map((c) => ({
+        updateOne: {
+          filter: { cloud_id: String(c._id) },
+          update: { $set: { cloud_id: String(c._id), uuid: c.uuid || null, code: c.code, name: c.name, phone: c.phone, kid_name: c.kid_name || "", kid_birthday: c.kid_birthday || "", kid_gender: c.kid_gender || "", points: c.points || 0, text: [c.name, c.code, c.kid_name].join(" ").toLowerCase(), synced: true, sync_error: "" } },
+          upsert: true,
+        },
+      }));
+      for (let k = 0; k < ops.length; k += 1000) await Customer.bulkWrite(ops.slice(k, k + 1000), { ordered: false });
+      await Customer.deleteMany({ synced: true, cloud_id: { $nin: d.customers.map((c) => String(c._id)) } });
+    }
+    const { products: _p, users: _u, customers: _c, ...rest } = d;
     const before = await Data.findById("main").select("payment_methods").lean();
     await keepQrOffline(rest.payment_methods, before?.payment_methods);
     await Data.replaceOne({ _id: "main" }, { _id: "main", ...rest, pulled_at: new Date() }, { upsert: true });
@@ -198,6 +210,12 @@ const forCloud = (s) => ({
   change_give_usd: s.change_give_usd,
   change_give_khr: s.change_give_khr,
   note: s.note,
+  promo_total: s.promo_total || 0,
+  promotions: s.promotions || [],
+  customer_id: s.customer_id || null,
+  customer_uuid: s.customer_uuid || null,
+  points_earned: s.points_earned || 0,
+  points_redeemed: s.points_redeemed || 0,
 });
 const shiftForCloud = (s) => ({
   shift_no: s.shift_no,
@@ -214,6 +232,7 @@ const shiftForCloud = (s) => ({
   counted_khr: s.counted_khr,
   report: s.report,
   note: s.note,
+  cash_moves: s.cash_moves || [],
 });
 
 const push = () => serial("push", doPush);
@@ -222,13 +241,31 @@ async function doPush() {
   if (!cfg?.device_key) return null;
   state.pushing = true;
   const out = { sent: 0, failed: 0 };
+  // the cloud's new point balances → the local copies (after this, the pending part is gone)
+  const applyPoints = async (r) => {
+    for (const [id, pts] of Object.entries(r?.customer_points || {})) await Customer.updateOne({ cloud_id: id }, { points: pts });
+  };
   try {
+    // customers added on this POS — before the invoices that use them
+    const newCustomers = await Customer.find({ synced: false }).limit(200).lean();
+    if (newCustomers.length) {
+      const r = await cloud("POST", "/pos-device/push", { key: cfg.device_key, body: { invoices: [], customers: newCustomers.map((c) => ({ uuid: c.uuid, name: c.name, phone: c.phone, kid_name: c.kid_name, kid_birthday: c.kid_birthday, kid_gender: c.kid_gender })) } });
+      for (const x of r.customers?.saved || []) {
+        const local = newCustomers.find((c) => c.uuid === x.uuid);
+        if (!local) continue;
+        await Customer.updateOne({ _id: local._id }, { synced: true, cloud_id: String(x._id), code: x.code || "", sync_error: "" });
+        await Sale.updateMany({ customer_local: String(local._id), customer_id: null }, { customer_id: String(x._id) });
+      }
+      for (const f of r.customers?.failed || []) await Customer.updateOne({ uuid: f.uuid }, { sync_error: f.error });
+      await applyPoints(r);
+    }
     for (let round = 0; round < 20; round++) {
       const list = await Sale.find({ synced: false, state: "paid" }).sort({ sold_at: 1 }).limit(50).lean();
       if (!list.length) break;
       const r = await cloud("POST", "/pos-device/push", { key: cfg.device_key, body: { invoices: list.map(forCloud) } });
       const done = [...r.accepted, ...r.duplicate];
       if (done.length) await Sale.updateMany({ uuid: { $in: done } }, { synced: true, synced_at: new Date(), sync_error: "" });
+      await applyPoints(r);
       for (const f of r.failed) await Sale.updateOne({ uuid: f.uuid }, { sync_error: f.error });
       out.sent += done.length;
       out.failed += r.failed.length;
@@ -241,6 +278,7 @@ async function doPush() {
       const rr = r.refunds || { accepted: [], duplicate: [], failed: [] };
       const ok = [...rr.accepted, ...rr.duplicate];
       if (ok.length) await Refund.updateMany({ uuid: { $in: ok } }, { synced: true, synced_at: new Date(), sync_error: "" });
+      await applyPoints(r);
       for (const f of rr.failed) await Refund.updateOne({ uuid: f.uuid }, { sync_error: f.error });
       out.refunds = ok.length;
     }

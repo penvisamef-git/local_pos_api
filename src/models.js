@@ -41,6 +41,7 @@ const Data = mongoose.model(
       payment_methods: { type: Array, default: [] },
       categories: { type: Array, default: [] },
       brands: { type: Array, default: [] },
+      promotions: { type: Array, default: [] }, // made in the admin, applied here (promo.js)
       pulled_at: Date,
     },
     opts,
@@ -92,6 +93,9 @@ const Shift = mongoose.model(
       counted_khr: Number,
       report: Object, // totals at close
       note: { type: String, default: "" },
+      // money in / out of the drawer that is not a sale: expenses, change brought in, layaway deposits, exchange cash-outs
+      // [{ uuid, type: in | out, kind: expense | float | safe_drop | deposit | deposit_back | exchange_cash | other, category, amount, currency, amount_usd, note, ref, by, by_name, approved_by_name, at }]
+      cash_moves: { type: Array, default: [] },
       synced: { type: Boolean, default: false, index: true }, // sent to the cloud (again after closing)
     },
     opts,
@@ -119,7 +123,17 @@ const Sale = mongoose.model(
       subtotal: Number,
       discount_type: { type: String, default: null },
       discount_value: { type: Number, default: 0 },
-      discount_total: { type: Number, default: 0 },
+      discount_total: { type: Number, default: 0 }, // manual bill discount
+      promo_total: { type: Number, default: 0 }, // promotions
+      promotions: { type: Array, default: [] }, // [{ promo_id, code, name_kh, name_en, amount }]
+      customer_id: { type: String, default: null }, // cloud id (null for a customer added here and not sent yet)
+      customer_uuid: { type: String, default: null },
+      customer_local: { type: String, default: null, index: true }, // local Customer _id
+      customer_name: { type: String, default: "" },
+      customer_phone: { type: String, default: "" },
+      points_earned: { type: Number, default: 0 },
+      points_redeemed: { type: Number, default: 0 },
+      points_balance: { type: Number, default: null }, // after this sale (for the receipt)
       tax_mode: String,
       tax_rate: Number,
       tax_name: String,
@@ -134,6 +148,8 @@ const Sale = mongoose.model(
       change_give_usd: { type: Number, default: 0 },
       change_give_khr: { type: Number, default: 0 },
       note: { type: String, default: "" },
+      layaway_no: { type: String, default: "" }, // paid with a layaway deposit (hold no.)
+      exchange_refund_no: { type: String, default: "" }, // paid with exchange credit from this refund
       state: { type: String, default: "paid" }, // paid | discarded (could not be sent, removed by a manager — never sent, not in totals)
       discarded_at: Date,
       discarded_by: String,
@@ -162,6 +178,12 @@ const Hold = mongoose.model(
       total: { type: Number, default: 0 }, // for the list (re-priced on resume)
       user_id: String,
       user_name: String,
+      // layaway: the customer paid a deposit (cash into the drawer); the hold stays until the sale is done or cancelled
+      customer_id: { type: String, default: null }, // local customer _id
+      customer_name: { type: String, default: "" },
+      customer_phone: { type: String, default: "" },
+      deposit_usd: { type: Number, default: 0 },
+      deposits: { type: Array, default: [] }, // [{ amount, currency, amount_usd, at, shift_no, by_name }]
     },
     opts,
   ),
@@ -190,8 +212,38 @@ const Refund = mongoose.model(
       rate: Number,
       total_khr: Number,
       payments: { type: Array, default: [] }, // [{ method_id, code, name_*, type, currency, amount, amount_usd }]
+      customer_local: { type: String, default: null }, // points of the sale's customer change here until the next sync
+      points_delta: { type: Number, default: 0 },
+      points_back: { type: Number, default: 0 }, // points used on the sale, given back (that part is not money)
+      points_back_usd: { type: Number, default: 0 },
+      // exchange: the money is kept as credit for a new sale (or given in cash later)
+      exchange: { type: Boolean, default: false },
+      exchange_used: { type: String, default: "" }, // invoice no. that used the credit, or "cash"
       synced: { type: Boolean, default: false, index: true },
       synced_at: Date,
+      sync_error: { type: String, default: "" },
+    },
+    opts,
+  ),
+);
+
+// ---------------- customers (copy from the cloud + the ones added on this POS) ----------------
+// points = the cloud balance at the last pull / push; sales / refunds not sent yet are added on top (pending).
+const Customer = mongoose.model(
+  "PosCustomer",
+  new Schema(
+    {
+      cloud_id: { type: String, default: null, index: true },
+      uuid: { type: String, default: null, index: true }, // made here (offline) → the same customer when pushed
+      code: { type: String, default: "" },
+      name: String,
+      phone: { type: String, index: true },
+      kid_name: { type: String, default: "" },
+      kid_birthday: { type: String, default: "" },
+      kid_gender: { type: String, default: "" },
+      points: { type: Number, default: 0 },
+      text: { type: String, default: "" }, // lowercase name / code / child for the search
+      synced: { type: Boolean, default: true, index: true }, // false = added here, not in the cloud yet
       sync_error: { type: String, default: "" },
     },
     opts,
@@ -211,4 +263,5 @@ async function nextSeq(key) {
   return doc.seq;
 }
 
-module.exports = { Config, Data, Product, User, Session, Shift, Sale, Hold, Refund, PosEvent, Counter, nextSeq };
+module.exports = {
+  Customer, Config, Data, Product, User, Session, Shift, Sale, Hold, Refund, PosEvent, Counter, nextSeq };

@@ -1,7 +1,7 @@
 const crypto = require("crypto");
 const express = require("express");
 const bcrypt = require("bcrypt");
-const { Config, Data, Product, User, Session, Shift, Sale, Hold, Refund, PosEvent, nextSeq } = require("./models");
+const { Config, Data, Product, User, Session, Shift, Sale, Hold, Refund, PosEvent, Customer, nextSeq } = require("./models");
 const sync = require("./sync");
 const { priceCart, settle, r2, r4, roundKhr } = require("./money");
 const L2 = (kh, en) => `${kh} / ${en}`;
@@ -217,7 +217,23 @@ const shiftTotals = async (shift) => {
   });
   const refundTotal = r2(refunds.reduce((t, r) => t + r.total, 0));
   const salesTotal = r2(sales.reduce((t, s) => t + s.total, 0));
+  // money in / out that is not a sale (expenses, float, layaway deposits, exchange cash-outs)
+  const moves = shift.cash_moves || [];
+  const sumMoves = (type, cur) => moves.filter((m) => m.type === type && (m.currency === "KHR") === (cur === "KHR")).reduce((t, m) => t + m.amount, 0);
+  const cash = { in_usd: r2(sumMoves("in", "USD")), in_khr: Math.round(sumMoves("in", "KHR")), out_usd: r2(sumMoves("out", "USD")), out_khr: Math.round(sumMoves("out", "KHR")) };
+  cashUsd += cash.in_usd - cash.out_usd;
+  cashKhr += cash.in_khr - cash.out_khr;
+  const byKind = {};
+  moves.forEach((m) => {
+    const k = `${m.type}:${m.kind}`;
+    if (!byKind[k]) byKind[k] = { type: m.type, kind: m.kind, count: 0, amount_usd: 0 };
+    byKind[k].count += 1;
+    byKind[k].amount_usd = r2(byKind[k].amount_usd + (m.amount_usd || 0));
+  });
   return {
+    cash_moves: cash,
+    cash_move_kinds: Object.values(byKind),
+    cash_move_count: moves.length,
     refund_count: refunds.length,
     refund_total: refundTotal,
     refund_methods: Object.values(refundMethods),
@@ -283,6 +299,57 @@ router.get("/shift", auth, wrap(async (req, res) => {
   ok(res, await Shift.find({}).sort({ opened_at: -1 }).limit(Math.min(Number(req.query.limit) || 20, 100)).lean());
 }));
 
+// ===================================== CASH IN / OUT (not a sale) ================================================
+const MOVE_KINDS = { out: ["expense", "safe_drop", "other"], in: ["float", "other"] };
+const r2u = (amount, currency, rate) => (currency === "KHR" ? r2(amount / (rate || 4100)) : r2(amount));
+// a manager on the POS, or a manager's PIN → { by } | { error, status }
+async function managerOf(req, approver) {
+  if (req.pos.is_manager) return { by: { _id: req.pos.user_id, name: req.pos.name } };
+  const a = approver || {};
+  if (!a.user_id || !a.pin) return { error: "ត្រូវការ PIN អ្នកគ្រប់គ្រងហាង / A shop manager's PIN is needed", status: 403 };
+  const r = await checkPin(a.user_id, a.pin);
+  if (r.error) return { error: r.error, status: r.status === 401 ? 403 : r.status };
+  if (!r.user.is_manager) return { error: "ត្រូវការ PIN អ្នកគ្រប់គ្រងហាង / A shop manager's PIN is needed", status: 403 };
+  return { by: { _id: r.user._id, name: fullName(r.user) } };
+}
+async function addCashMove(shift, req, m, by = null) {
+  const data = await Data.findById("main").select("rate").lean();
+  const rate = Number(data?.rate?.rate) || 4100;
+  const currency = m.currency === "KHR" ? "KHR" : "USD";
+  const amount = currency === "KHR" ? Math.round(m.amount) : r2(m.amount);
+  const move = { uuid: crypto.randomUUID(), type: m.type, kind: m.kind, category: String(m.category || "").slice(0, 40), amount, currency, amount_usd: r2u(amount, currency, rate), note: String(m.note || "").trim().slice(0, 200), ref: String(m.ref || "").slice(0, 60), by: req.pos.user_id, by_name: req.pos.name, approved_by_name: by?.name || "", at: new Date() };
+  await Shift.updateOne({ _id: shift._id }, { $push: { cash_moves: move }, $set: { synced: false } });
+  return move;
+}
+
+// { type: in | out, kind, category, amount, currency, note, approver } — money out needs a manager
+router.post("/shift/cash", auth, wrap(async (req, res) => {
+  const shift = await Shift.findOne({ state: "open" }).lean();
+  if (!shift) return bad(res, "សូមបើកវេនសិន / Open a shift first", 409);
+  const b = req.body || {};
+  const type = b.type === "in" ? "in" : b.type === "out" ? "out" : null;
+  if (!type) return bad(res, "in / out?");
+  const kind = MOVE_KINDS[type].includes(b.kind) ? b.kind : "other";
+  const amount = Number(b.amount);
+  if (!(amount > 0) || amount > 1e9) return bad(res, "ចំនួនខុស / Wrong amount");
+  if (!String(b.note || "").trim()) return bad(res, "សូមសរសេរមូលហេតុ / Write what it is for");
+  let by = null;
+  if (type === "out") {
+    const r = await managerOf(req, b.approver);
+    if (r.error) return bad(res, r.error, r.status);
+    by = r.by;
+    // can't take out more cash than the drawer should have
+    const t = await shiftTotals(shift);
+    const want = b.currency === "KHR" ? Math.round(amount) : r2(amount);
+    const have = b.currency === "KHR" ? t.expected_khr : t.expected_usd;
+    if (want > have + 0.004) return bad(res, `${L2("ក្នុងថតមិនគ្រប់", "Not that much in the drawer")} (${b.currency === "KHR" ? `${have}៛` : `$${have.toFixed(2)}`})`);
+  }
+  const move = await addCashMove(shift, req, { type, kind, category: b.category, amount, currency: b.currency, note: b.note }, by);
+  sync.push().catch(() => {});
+  const fresh = await Shift.findById(shift._id).lean();
+  ok(res, { move, shift: { ...fresh, totals: await shiftTotals(fresh) } }, type === "out" ? "បានដកលុយចេញ / Cash out saved" : "បានដាក់លុយចូល / Cash in saved");
+}));
+
 // ===================================== HOLD (park a cart) ================================================
 // A customer goes back to shop more → hold their cart, serve the next customer, resume it later.
 router.get("/hold", auth, wrap(async (req, res) => {
@@ -301,24 +368,159 @@ router.post("/hold", auth, wrap(async (req, res) => {
   const { ymd } = yymm();
   const no = await nextSeq(`H${ymd}`);
   const discount = b.discount && Number(b.discount.value) > 0 ? { type: b.discount.type === "percent" ? "percent" : "amount", value: Number(b.discount.value) } : null;
+  // layaway: a deposit in cash goes into the open shift's drawer
+  let deposit = null;
+  let customer = null;
+  if (b.customer_id) customer = await Customer.findById(String(b.customer_id)).lean().catch(() => null);
+  if (b.deposit && Number(b.deposit.amount) > 0) {
+    const shift = await Shift.findOne({ state: "open" }).lean();
+    if (!shift) return bad(res, "សូមបើកវេនសិន / Open a shift first", 409);
+    if (!customer && !String(b.label || "").trim()) return bad(res, "កក់ប្រាក់: សូមជ្រើសអតិថិជន ឬសរសេរឈ្មោះ / Deposit: choose the customer or write a name");
+    deposit = { shift, amount: Number(b.deposit.amount), currency: b.deposit.currency === "KHR" ? "KHR" : "USD" };
+  }
   const h = await Hold.create({
     hold_no: no,
-    label: String(b.label || "").trim().slice(0, 60),
+    label: String(b.label || customer?.name || "").trim().slice(0, 60),
     items,
     discount,
     note: String(b.note || "").slice(0, 200),
     total: r2(Number(b.total) || 0),
     user_id: req.pos.user_id,
     user_name: req.pos.name,
+    customer_id: customer ? String(customer._id) : null,
+    customer_name: customer?.name || "",
+    customer_phone: customer?.phone || "",
   });
-  ok(res, h.toObject(), `បានរក្សាទុក #${no}`);
+  if (deposit) await takeDeposit(h, deposit, req);
+  ok(res, (await Hold.findById(h._id).lean()), deposit ? `បានកក់ #${no} / Layaway #${no} saved` : `បានរក្សាទុក #${no}`);
 }));
 
-// resume = take it back (it leaves the list) · or just delete it
-router.delete("/hold/:id", auth, wrap(async (req, res) => {
-  const h = await Hold.findByIdAndDelete(req.params.id).lean().catch(() => null);
+async function takeDeposit(h, { shift, amount, currency }, req) {
+  const move = await addCashMove(shift, req, { type: "in", kind: "deposit", amount, currency, note: `${L2("កក់ប្រាក់", "Layaway deposit")} #${h.hold_no} ${h.label || ""}`.trim(), ref: String(h._id) });
+  await Hold.updateOne({ _id: h._id }, { $inc: { deposit_usd: move.amount_usd }, $push: { deposits: { amount: move.amount, currency: move.currency, amount_usd: move.amount_usd, at: move.at, shift_no: shift.shift_no, by_name: req.pos.name } } });
+  sync.push().catch(() => {});
+}
+
+// more deposit on a layaway: { amount, currency }
+router.post("/hold/:id/deposit", auth, wrap(async (req, res) => {
+  const h = await Hold.findById(req.params.id).lean().catch(() => null);
   if (!h) return bad(res, "រកមិនឃើញ / Held cart not found", 404);
+  const shift = await Shift.findOne({ state: "open" }).lean();
+  if (!shift) return bad(res, "សូមបើកវេនសិន / Open a shift first", 409);
+  const amount = Number(req.body?.amount);
+  if (!(amount > 0)) return bad(res, "ចំនួនខុស / Wrong amount");
+  await takeDeposit(h, { shift, amount, currency: req.body?.currency === "KHR" ? "KHR" : "USD" }, req);
+  ok(res, await Hold.findById(h._id).lean(), L2("បានទទួលប្រាក់កក់", "Deposit taken"));
+}));
+
+// resume: a plain hold leaves the list; a layaway (deposit paid) stays until its sale is done
+router.post("/hold/:id/resume", auth, wrap(async (req, res) => {
+  const h = await Hold.findById(req.params.id).lean().catch(() => null);
+  if (!h) return bad(res, "រកមិនឃើញ / Held cart not found", 404);
+  if (!(h.deposit_usd > 0)) await Hold.deleteOne({ _id: h._id });
+  const customer = h.customer_id ? await Customer.findById(h.customer_id).lean().catch(() => null) : null;
+  ok(res, { ...h, customer: customer ? await customerView(customer) : null });
+}));
+
+// delete: a layaway gives the deposit back from the drawer (manager) — { approver, give_back: true }
+router.delete("/hold/:id", auth, wrap(async (req, res) => {
+  const h = await Hold.findById(req.params.id).lean().catch(() => null);
+  if (!h) return bad(res, "រកមិនឃើញ / Held cart not found", 404);
+  if (h.deposit_usd > 0) {
+    const r = await managerOf(req, req.body?.approver);
+    if (r.error) return bad(res, r.error, r.status);
+    const shift = await Shift.findOne({ state: "open" }).lean();
+    if (!shift) return bad(res, "សូមបើកវេនសិន / Open a shift first", 409);
+    if (req.body?.give_back !== false) {
+      // back in the currencies it came in
+      const byCur = {};
+      (h.deposits || []).forEach((d) => (byCur[d.currency] = (byCur[d.currency] || 0) + d.amount));
+      for (const [currency, amount] of Object.entries(byCur)) {
+        await addCashMove(shift, req, { type: "out", kind: "deposit_back", amount, currency, note: `${L2("សងប្រាក់កក់", "Deposit back")} #${h.hold_no} ${h.label || ""}`.trim(), ref: String(h._id) }, r.by);
+      }
+    } else {
+      // kept by the shop (the customer gave up the layaway): note it, no money moves
+      await addCashMove(shift, req, { type: "in", kind: "deposit_kept", amount: 0, currency: "USD", note: `${L2("ហាងទុកប្រាក់កក់", "Deposit kept")} #${h.hold_no} ($${h.deposit_usd.toFixed(2)})`, ref: String(h._id) }, r.by);
+    }
+    sync.push().catch(() => {});
+  }
+  await Hold.deleteOne({ _id: h._id });
   ok(res, h);
+}));
+
+// ===================================== CUSTOMERS (loyalty) ================================================
+// points shown = cloud balance + what this POS changed and has not sent yet
+const POINTS_METHOD = { _id: "points", code: "points", name_kh: "ពិន្ទុ", name_en: "Points", type: "points", currency: "USD" };
+const DEPOSIT_METHOD = { _id: "deposit", code: "deposit", name_kh: "ប្រាក់កក់", name_en: "Deposit", type: "credit", currency: "USD" };
+const EXCHANGE_METHOD = { _id: "exchange", code: "exchange", name_kh: "ប្តូរទំនិញ", name_en: "Exchange credit", type: "credit", currency: "USD" };
+const phoneOf = (v) => {
+  let d = String(v || "").replace(/\D/g, "");
+  if (d.startsWith("855")) d = `0${d.slice(3)}`;
+  if (d && !d.startsWith("0")) d = `0${d}`;
+  return d.length >= 8 && d.length <= 11 ? d : null;
+};
+async function pendingPoints(localId) {
+  const [sales, refunds] = await Promise.all([
+    Sale.find({ customer_local: String(localId), synced: false, state: "paid" }).select("points_earned points_redeemed").lean(),
+    Refund.find({ customer_local: String(localId), synced: false }).select("points_delta").lean(),
+  ]);
+  return sales.reduce((t, x) => t + (x.points_earned || 0) - (x.points_redeemed || 0), 0) + refunds.reduce((t, x) => t + (x.points_delta || 0), 0);
+}
+const customerView = async (c) => ({ _id: String(c._id), cloud_id: c.cloud_id, code: c.code, name: c.name, phone: c.phone, kid_name: c.kid_name, kid_birthday: c.kid_birthday, kid_gender: c.kid_gender, points: (c.points || 0) + (await pendingPoints(c._id)), not_sent: !c.synced });
+const loyaltyOf = (data) => ({
+  enabled: data?.setting?.loyalty_enabled !== false,
+  points_per_usd: Number(data?.setting?.points_per_usd ?? 1),
+  point_value_usd: Number(data?.setting?.point_value_usd ?? 0.01),
+  min_redeem_points: Number(data?.setting?.min_redeem_points ?? 100),
+});
+
+// ?q= name / phone / code / child (≥ 2 letters or 3 digits)
+// Bakong KHQR: the screen asks every few seconds; we ask the cloud (it holds the Bakong token).
+// Offline → { offline: true } and the cashier confirms by hand.
+router.post("/khqr/check", auth, wrap(async (req, res) => {
+  const md5 = String(req.body?.md5 || "").toLowerCase();
+  if (!/^[a-f0-9]{32}$/.test(md5)) return bad(res, "md5?");
+  const cfg = await sync.getConfig();
+  if (!cfg?.device_key) return ok(res, { ready: false, paid: false });
+  try {
+    ok(res, await sync.cloud("POST", "/pos-device/khqr/check", { key: cfg.device_key, body: { md5 } }));
+  } catch (e) {
+    ok(res, { ready: true, paid: false, offline: !!e.offline, error: e.message });
+  }
+}));
+
+router.get("/customer", auth, wrap(async (req, res) => {
+  const q = String(req.query.q || "").trim();
+  const digits = q.replace(/\D/g, "");
+  const f = {};
+  if (digits.length >= 3 && digits.length === q.replace(/[\s+-]/g, "").length) f.phone = { $regex: digits.replace(/^855/, "0") };
+  else if (q.length >= 2) f.text = { $regex: q.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&") };
+  else return ok(res, []);
+  const rows = await Customer.find(f).sort({ name: 1 }).limit(20).lean();
+  ok(res, await Promise.all(rows.map(customerView)));
+}));
+
+router.get("/customer/:id", auth, wrap(async (req, res) => {
+  const c = await Customer.findById(req.params.id).lean().catch(() => null);
+  if (!c) return bad(res, "រកមិនឃើញអតិថិជន / Customer not found", 404);
+  ok(res, await customerView(c));
+}));
+
+// a new customer, here (also offline) → sent to the cloud with the next push
+router.post("/customer", auth, needPaired, wrap(async (req, res) => {
+  const b = req.body || {};
+  const name = String(b.name || "").trim().slice(0, 80);
+  const phone = phoneOf(b.phone);
+  if (!name) return bad(res, "សូមបញ្ចូលឈ្មោះ / Name is required");
+  if (!phone) return bad(res, "លេខទូរស័ព្ទមិនត្រឹមត្រូវ / Wrong phone number");
+  const kidBirthday = String(b.kid_birthday || "").slice(0, 10);
+  if (kidBirthday && !/^\d{4}-\d{2}-\d{2}$/.test(kidBirthday)) return bad(res, "ថ្ងៃកំណើតខុស / Wrong birthday");
+  const same = await Customer.findOne({ phone }).lean();
+  if (same) return res.status(409).json({ success: false, message: `លេខនេះជាអតិថិជនរួចហើយ: ${same.name} / Already a customer: ${same.name}`, data: await customerView(same) });
+  const kid = String(b.kid_name || "").trim().slice(0, 80);
+  const c = await Customer.create({ uuid: crypto.randomUUID(), name, phone, kid_name: kid, kid_birthday: kidBirthday, kid_gender: ["boy", "girl"].includes(b.kid_gender) ? b.kid_gender : "", text: [name, kid].join(" ").toLowerCase(), points: 0, synced: false });
+  sync.push().catch(() => {});
+  ok(res, await customerView(c.toObject()), `បានបន្ថែម ${name}`);
 }));
 
 // ===================================== SALE ================================================
@@ -387,10 +589,45 @@ router.post("/sale", auth, needPaired, wrap(async (req, res) => {
     }
   }
 
-  const totals = priceCart(cart, { discount, setting: data.setting, rate: data.rate });
+  // customer (loyalty)
+  let customer = null;
+  if (b.customer_id) {
+    customer = await Customer.findById(String(b.customer_id)).lean().catch(() => null);
+    if (!customer) return bad(res, "រកមិនឃើញអតិថិជន / Customer not found", 404);
+  }
+  const loyalty = loyaltyOf(data);
+  const balance = customer ? (customer.points || 0) + (await pendingPoints(customer._id)) : 0;
+
+  const totals = priceCart(cart, { discount, setting: data.setting, rate: data.rate, promotions: data.promotions || [], promo: { warehouse_id: data.warehouse?._id, has_customer: !!customer, categories: data.categories } });
   if (totals.error) return bad(res, totals.error);
   const methods = new Map((data.payment_methods || []).map((m) => [String(m._id), m]));
   const pays = [];
+  // points used as money (first)
+  const redeem = Math.max(0, Math.trunc(Number(b.redeem_points) || 0));
+  let redeemUsd = 0;
+  if (redeem) {
+    if (!customer) return bad(res, "សូមជ្រើសអតិថិជន / Choose the customer");
+    if (!loyalty.enabled) return bad(res, "ពិន្ទុត្រូវបានបិទ / Points are off");
+    if (redeem < loyalty.min_redeem_points) return bad(res, `${L2("ប្រើយ៉ាងតិច", "use at least")} ${loyalty.min_redeem_points} ${L2("ពិន្ទុ", "points")}`);
+    if (redeem > balance) return bad(res, `${L2("ពិន្ទុមិនគ្រប់", "Not enough points")} (${balance})`);
+    redeemUsd = r2(redeem * loyalty.point_value_usd);
+    if (redeemUsd > totals.total + 0.005) return bad(res, L2("ពិន្ទុលើសតម្លៃវិក្កយបត្រ", "More points than the bill"));
+    pays.push({ method: POINTS_METHOD, amount: redeemUsd, reference: `${redeem} pts` });
+  }
+  // layaway deposit / exchange credit = money already in the shop (not cash today)
+  let hold = null;
+  if (b.hold_id) {
+    hold = await Hold.findById(String(b.hold_id)).lean().catch(() => null);
+    if (!hold) return bad(res, "រកមិនឃើញការកក់ / Layaway not found", 404);
+    if (hold.deposit_usd > 0) pays.push({ method: DEPOSIT_METHOD, amount: hold.deposit_usd, reference: `#${hold.hold_no}` });
+  }
+  let credit = null;
+  if (b.exchange_refund_id) {
+    credit = await Refund.findOne({ $or: [{ uuid: String(b.exchange_refund_id) }, { refund_no: String(b.exchange_refund_id) }] }).lean();
+    if (!credit || !credit.exchange) return bad(res, "រកមិនឃើញការប្តូរ / Exchange not found", 404);
+    if (credit.exchange_used) return bad(res, `${L2("បានប្រើរួច", "Already used")}: ${credit.exchange_used}`, 409);
+    if (credit.total > 0) pays.push({ method: EXCHANGE_METHOD, amount: credit.total, reference: credit.refund_no });
+  }
   for (const p of Array.isArray(b.payments) ? b.payments : []) {
     const m = methods.get(String(p.method_id));
     if (!m) return bad(res, "វិធីបង់ប្រាក់មិនត្រឹមត្រូវ / Unknown payment method");
@@ -398,6 +635,7 @@ router.post("/sale", auth, needPaired, wrap(async (req, res) => {
   }
   const paid = settle(totals, pays, data.setting);
   if (paid.error) return bad(res, paid.error);
+  const earned = customer && loyalty.enabled ? Math.floor(Math.max(0, totals.total - redeemUsd) * loyalty.points_per_usd + 1e-9) : 0;
 
   const { ym } = yymm();
   const invoiceNo = `${req.cfg.device.code}-${ym}-${String(await nextSeq(`INV${ym}`)).padStart(5, "0")}`;
@@ -419,6 +657,16 @@ router.post("/sale", auth, needPaired, wrap(async (req, res) => {
     discount_type: discount?.type || null,
     discount_value: discount?.value || 0,
     discount_total: totals.discount_total,
+    promo_total: totals.promo_total || 0,
+    promotions: totals.promotions || [],
+    customer_id: customer?.cloud_id || null,
+    customer_uuid: customer?.uuid || null,
+    customer_local: customer ? String(customer._id) : null,
+    customer_name: customer?.name || "",
+    customer_phone: customer?.phone || "",
+    points_earned: earned,
+    points_redeemed: redeem,
+    points_balance: customer ? balance - redeem + earned : null,
     tax_mode: totals.tax_mode,
     tax_rate: totals.tax_rate,
     tax_name: data.setting?.tax_name || "VAT",
@@ -433,7 +681,11 @@ router.post("/sale", auth, needPaired, wrap(async (req, res) => {
     change_give_usd: paid.change_give_usd,
     change_give_khr: paid.change_give_khr,
     note: String(b.note || "").slice(0, 300),
+    layaway_no: hold ? String(hold.hold_no) : "",
+    exchange_refund_no: credit?.refund_no || "",
   });
+  if (hold) await Hold.deleteOne({ _id: hold._id });
+  if (credit) await Refund.updateOne({ _id: credit._id, exchange_used: "" }, { exchange_used: invoiceNo });
   // the shop stock on this screen goes down at once (the cloud gets it with the push)
   for (const l of totals.lines) {
     await Product.updateOne({ "doc.variants._id": l.variant_id }, { $inc: { "doc.variants.$.stock": -l.base_qty } }).catch(() => {});
@@ -507,6 +759,25 @@ router.get("/receipt/:id", auth, wrap(async (req, res) => {
 // Money back for some items (refund) or the whole invoice (void). The drawer of the OPEN shift pays it back.
 // A shop manager may; a cashier needs a manager's PIN. Stock comes back on this screen at once and in the cloud with the push.
 // body: { lines: [{ index, qty }] | all: true, reason, method_id, approver: { user_id, pin } }
+// exchange not finished (the customer wants the money after all): the credit is paid out of the drawer
+router.post("/refund/:id/exchange-cash", auth, wrap(async (req, res) => {
+  const rf = await Refund.findOne({ $or: [{ uuid: req.params.id }, { refund_no: req.params.id }] }).lean();
+  if (!rf || !rf.exchange) return bad(res, "រកមិនឃើញការប្តូរ / Exchange not found", 404);
+  if (rf.exchange_used) return bad(res, `${L2("បានប្រើរួច", "Already used")}: ${rf.exchange_used}`, 409);
+  const shift = await Shift.findOne({ state: "open" }).lean();
+  if (!shift) return bad(res, "សូមបើកវេនសិន / Open a shift first", 409);
+  const done = await Refund.updateOne({ _id: rf._id, exchange_used: "" }, { exchange_used: "cash" });
+  if (!done.modifiedCount) return bad(res, L2("បានប្រើរួច", "Already used"), 409);
+  const move = await addCashMove(shift, req, { type: "out", kind: "exchange_cash", amount: rf.total, currency: "USD", note: `${L2("សងប្រាក់ (មិនប្តូរ)", "Exchange paid in cash")} ${rf.refund_no}`, ref: rf.refund_no });
+  sync.push().catch(() => {});
+  ok(res, move, L2("បានសងប្រាក់", "Money given back"));
+}));
+
+// exchanges not used yet (credit waiting)
+router.get("/exchange/open", auth, wrap(async (req, res) => {
+  ok(res, await Refund.find({ exchange: true, exchange_used: "" }).sort({ refunded_at: -1 }).limit(20).lean());
+}));
+
 router.post("/sale/:id/refund", auth, needPaired, wrap(async (req, res) => {
   const b = req.body || {};
   const s = await Sale.findOne({ $or: [{ uuid: req.params.id }, { invoice_no: req.params.id }] });
@@ -568,14 +839,28 @@ router.post("/sale/:id/refund", auth, needPaired, wrap(async (req, res) => {
   let total = r2(out.reduce((t, l) => t + l.amount, 0));
   const everything = lines.length === s.items.filter((i) => i.qty - (i.refunded_qty || 0) > 1e-9).length && lines.every(({ i, q }) => Math.abs(q - (i.qty - (i.refunded_qty || 0))) < 1e-9);
   if (everything) total = r2(Math.min(s.total - (s.refunded_total || 0), Math.max(total, fullLeft))); // the last refund takes the rounding cents
+  // part paid with points goes back as points (not money); points earned on what goes back are taken back
+  const value = total; // value of the items given back
+  let pointsBack = 0;
+  let pointsBackUsd = 0;
+  let pointsDelta = 0;
+  if (s.customer_local || s.customer_id) {
+    const pointsUsd = (s.payments || []).filter((p) => p.code === "points").reduce((t, p) => t + (p.amount_usd || 0), 0);
+    if (pointsUsd > 0 && s.total > 0) {
+      pointsBackUsd = r2(Math.min(value, (value * pointsUsd) / s.total));
+      pointsBack = Math.round(((s.points_redeemed || 0) * value) / s.total);
+      total = r2(value - pointsBackUsd);
+    }
+    pointsDelta = pointsBack - Math.round(((s.points_earned || 0) * value) / (s.total || 1));
+  }
   const data = await Data.findById("main").lean();
   const methods = data?.payment_methods || [];
-  const m = methods.find((x) => String(x._id) === String(b.method_id)) || methods.find((x) => x.type === "cash" && x.currency !== "KHR") || methods[0];
+  const m = b.exchange ? EXCHANGE_METHOD : methods.find((x) => String(x._id) === String(b.method_id)) || methods.find((x) => x.type === "cash" && x.currency !== "KHR") || methods[0];
   if (!m) return bad(res, "គ្មានវិធីបង់ប្រាក់ / No payment method");
   const rate = s.rate || Number(data?.rate?.rate) || 4100;
   const step = Number(data?.setting?.khr_rounding) || 100;
   const khrAmount = roundKhr(total * rate, step);
-  const payment = { method_id: m._id, code: m.code, name_kh: m.name_kh, name_en: m.name_en, type: m.type, currency: m.currency === "KHR" ? "KHR" : "USD", amount: m.currency === "KHR" ? khrAmount : total, amount_usd: total };
+  const payment = { method_id: m._id, code: m.code, name_kh: m.name_kh, name_en: m.name_en, type: m.type, currency: m.currency === "KHR" ? "KHR" : "USD", amount: m.currency === "KHR" ? khrAmount : total, amount_usd: total, reference: b.exchange ? L2("ប្រើទិញទំនិញថ្មី", "for new items") : "" };
 
   const { ym } = yymm();
   const refundNo = `${req.cfg.device.code}-R${ym}-${String(await nextSeq(`R${ym}`)).padStart(5, "0")}`;
@@ -597,14 +882,19 @@ router.post("/sale/:id/refund", auth, needPaired, wrap(async (req, res) => {
     total,
     rate,
     total_khr: khrAmount,
-    payments: [payment],
+    payments: total > 0 ? [payment] : [],
+    points_back: pointsBack,
+    points_back_usd: pointsBackUsd,
+    customer_local: s.customer_local || null,
+    points_delta: pointsDelta,
+    exchange: !!b.exchange,
   });
   // the invoice remembers what went back
   lines.forEach(({ k, q }) => {
     items[k].refunded_qty = r4((items[k].refunded_qty || 0) + q);
   });
   s.items = items;
-  s.refunded_total = r2((s.refunded_total || 0) + total);
+  s.refunded_total = r2((s.refunded_total || 0) + value);
   s.refund_status = items.every((i) => i.qty - (i.refunded_qty || 0) < 1e-9) ? "full" : "partial";
   s.markModified("items");
   await s.save();

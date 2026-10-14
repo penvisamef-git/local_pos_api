@@ -36,17 +36,23 @@ Production: build the screen (`cd ../local_pos && npm run build`); this server t
 | `GET` | `/shift/current` · `/shift` · `/shift/:id` | open shift with live totals · history |
 | `POST` | `/shift/open` | `{ opening_usd, opening_khr }` — one open shift per POS |
 | `POST` | `/shift/close` | `{ counted_usd, counted_khr, note }` → report: sales, per payment method, expected vs counted cash |
-| `POST` | `/sale` | `{ items: [{ variant_id, unit_id, qty }], discount: { type: amount\|percent, value }, approver: { user_id, pin }, stock_approver: { user_id, pin }, payments: [{ method_id, amount, reference }], note }` |
+| `POST` | `/sale` | `{ items: [{ variant_id, unit_id, qty }], discount: { type: amount\|percent, value }, approver: { user_id, pin }, stock_approver: { user_id, pin }, payments: [{ method_id, amount, reference }], customer_id, redeem_points, hold_id (layaway: its deposit pays first), exchange_refund_id (exchange credit pays first), note }` — promotions applied by themselves |
+| `GET` · `POST` | `/customer?q=` · `/customer/:id` · `/customer` | loyalty customers (search by phone / name) · add one here (also offline; 409 + the customer when the phone exists) |
+| `POST` | `/khqr/check` | `{ md5 }` → asks the cloud whether the Bakong KHQR is paid (`{ ready, paid, hash }`, `offline: true` without internet) |
+| `POST` | `/shift/cash` | `{ type: in\|out, kind: expense\|safe_drop\|float\|other, amount, currency, note, approver }` — money in / out of the drawer that is not a sale; **out** needs a shop manager and never more than the drawer should have |
 | `GET` | `/sale` · `/sale/:id` · `/receipt/:id` | today's / shift's invoices · one invoice · receipt data (reprint) |
 | `GET` | `/sale?problem=true` | invoices the cloud refused (any shift), with `sync_error` |
 | `POST` | `/sale/:id/retry` | send it again now → 200 sent · 409 with the cloud's reason |
 | `POST` | `/sale/:id/discard` | `{ reason, approver: { user_id, pin } }` (shop manager) → `state: discarded`: never sent, left out of totals; only for invoices not in the cloud |
-| `POST` | `/sale/:id/refund` | `{ lines: [{ index, qty }] \| all: true, reason, method_id, approver: { user_id, pin } }` → money back from the **open shift's** drawer (shop manager, or a manager's PIN); never more than left; stock back here at once; `kind: void` = everything, first time → `{ refund, sale }` |
+| `POST` | `/refund/:id/exchange-cash` · `GET /exchange/open` | an exchange the customer did not use → the credit is paid in cash from the drawer (once) · exchanges with credit waiting |
+| `POST` | `/sale/:id/refund` | `{ lines: [{ index, qty }] \| all: true, reason, method_id, exchange (true = keep it as credit for new items, no cash), approver: { user_id, pin } }` → money back from the **open shift's** drawer (shop manager, or a manager's PIN); never more than left; stock back here at once; `kind: void` = everything, first time → `{ refund, sale }` |
 | `GET` | `/refund` | `?shift_id=&sale=` refunds made on this POS |
 | `POST` | `/approve` | `{ user_id, pin }` — checks a shop manager's PIN on the cashier's screen (wrong PIN → 403, the cashier stays logged in) |
 | `GET` | `/hold` | held (parked) carts of this POS, oldest first |
-| `POST` | `/hold` | `{ label, items: [{ variant_id, unit_id, qty }], discount, note, total }` → park the cart (max 50, no `H<yymmdd>-n`) |
-| `DELETE` | `/hold/:id` | take a held cart back (resume) or delete it; returns the held cart |
+| `POST` | `/hold` | `{ label, items: [{ variant_id, unit_id, qty }], discount, note, total, customer_id, deposit: { amount, currency } }` → park the cart (max 50, no `H<yymmdd>-n`); with a deposit = **layaway** (cash into the open shift's drawer) |
+| `POST` | `/hold/:id/resume` | take it back: a plain hold leaves the list; a layaway stays until its sale (`hold_id`) is done |
+| `POST` | `/hold/:id/deposit` | `{ amount, currency }` — more deposit on a layaway |
+| `DELETE` | `/hold/:id` | delete; a layaway needs a shop manager (`approver`) and gives the deposit back from the drawer (`give_back: false` = the shop keeps it) |
 | `GET` | `/report?date=YYYY-MM-DD&user_id=` | sales of one day (Phnom Penh time): totals, payments (net of change), by hour, top items, shifts, last 7 days; a shop manager also gets *by cashier*. A cashier always gets only their own sales (`user_id` ignored) |
 | `PUT` | `/display` | `{ mode: idle\|cart\|pay\|done, data }` — what the customer display shows (sent by the sell screen) |
 | `GET` | `/display` · `/display/stream` | no login: shop name / logo + current screen · live updates (Server-Sent Events) for the customer display |
